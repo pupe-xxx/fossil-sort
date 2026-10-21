@@ -41,7 +41,10 @@ const FOSSIL_NAME: Record<Depth, [string, string]> = {
 
 // 動きの時間（ミリ秒）
 const SHIFT_MS = 200;
-const FALL_MS = 200;
+const FALL_MS = 300;
+/** 落ちる石は、柱ごとにこれだけ遅らせて、ガラガラと順に落とす */
+const FALL_STAGGER = 16;
+const FALL_EACH = FALL_MS - FALL_STAGGER * 5;
 const FLASH_MS = 300;
 const SINK_MS = 190;
 const DIG_MS = 900;
@@ -50,6 +53,10 @@ const DIG_MS = 900;
 let current = 0;
 /** ヒントの手。どの状態の時に出したかも持ち、状態が変わったら消えたことにする */
 let hinted: { state: State; move: Move } | null = null;
+/** なぞっている段と、指が動いた距離（1マス分まで）。指についてくるように描く */
+let dragging: { row: number; dx: number } | null = null;
+/** 指を離した時に、段がすでに何マス分（0〜1）動いていたか。そこから続けて滑らせる */
+let shiftFrom = 0;
 
 const ease = (p: number) => 1 - (1 - p) * (1 - p);
 
@@ -316,6 +323,66 @@ function drawBoard(ctx: CanvasRenderingContext2D, cols: Board, skip?: (c: number
   cols.forEach((col, c) => col.forEach((v, r) => !skip?.(c, r) && drawStone(ctx, v, x(c), rowY(r), width)));
 }
 
+/** 段 row の石だけを、横に offset ずらして描く。端からはみ出た石は、反対の端からも描く（盤の幅で切る） */
+function drawShiftedRow(ctx: CanvasRenderingContext2D, cols: Board, row: number, offset: number) {
+  const n = cols.length;
+  const { x, width, spacing, left, right } = layout(n);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(left - 4, BOARD_TOP - 10, right - left + 8, BASE_Y - BOARD_TOP + 20);
+  ctx.clip();
+  cols.forEach((col, c) => {
+    if (col.length <= row) return;
+    const px = x(c) + offset;
+    drawStone(ctx, col[row], px, rowY(row), width);
+    if (px + spacing / 2 > right) drawStone(ctx, col[row], px - spacing * n, rowY(row), width);
+    if (px - spacing / 2 < left) drawStone(ctx, col[row], px + spacing * n, rowY(row), width);
+  });
+  ctx.restore();
+}
+
+/** 1つの落ちる石が、落ち始めるまでの遅れ（柱の順に、ガラガラと落とす） */
+const fallDelay = (f: { col: number }) => f.col * FALL_STAGGER;
+const isDrop = (f: { fromRow: number; toRow: number }) => f.fromRow > f.toRow;
+
+/** 画面のゆれ。石が着地した時と、たくさん割れた時に揺らす */
+function shakeOf(out: Outcome, ms: number): number {
+  let amp = 0;
+  const land = SHIFT_MS + FALL_MS;
+  if (out.falls.some(isDrop) && ms > land - 60 && ms < land + 140) amp = Math.max(amp, 5 * (1 - Math.abs(ms - land) / 140));
+  let at = land;
+  for (const round of out.rounds) {
+    const big = Math.min(1, round.removed.length / 9);
+    const p = (ms - at) / FLASH_MS;
+    if (p > 0.4 && p < 1) amp = Math.max(amp, 7 * big * (1 - p));
+    at += FLASH_MS + SINK_MS;
+  }
+  return amp;
+}
+
+/** 着地した石の下から上がる土ぼこり */
+function drawDust(ctx: CanvasRenderingContext2D, out: Outcome, ms: number) {
+  const { x, width } = layout(out.afterShift.length);
+  for (const f of out.falls) {
+    if (!isDrop(f)) continue;
+    const t0 = ms - (SHIFT_MS + fallDelay(f) + FALL_EACH);
+    if (t0 < 0 || t0 > 260) continue;
+    const p = t0 / 260;
+    ctx.save();
+    ctx.globalAlpha = 0.45 * (1 - p);
+    ctx.fillStyle = '#c9b48a';
+    for (let k = 0; k < 6; k++) {
+      const side = k % 2 ? 1 : -1;
+      const px = x(f.col) + side * (width * 0.3 + p * 28 * (1 + (k >> 1) * 0.5));
+      const py = rowY(f.toRow) + ROW * 0.42 - p * (8 + k * 3);
+      ctx.beginPath();
+      ctx.arc(px, py, 4 + p * 7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
 /** ヒント：ずらす向きの大きな矢印を、段の上に重ねる */
 function drawHint(ctx: CanvasRenderingContext2D, n: number, move: Move) {
   const { left, right } = layout(n);
@@ -361,40 +428,26 @@ const durationOf = (out: Outcome) =>
 function drawAnim(ctx: CanvasRenderingContext2D, state: State, anim: Anim<State, Outcome>) {
   const out = anim.events;
   const before = anim.from.cols;
-  const n = before.length;
-  const { x, width, spacing, left, right } = layout(n);
+  const { x, width, spacing } = layout(before.length);
   let ms = anim.t * durationOf(out);
   const { row, dir } = out.move;
 
-  // 1. 段が横にずれる（端から出た石は、反対の端から入る）
+  // 1. 段が横にずれる（指を離した所から続けて滑らせる。端から出た石は、反対の端から入る）
   if (ms < SHIFT_MS) {
-    const p = ease(ms / SHIFT_MS);
+    const p = shiftFrom + (1 - shiftFrom) * ease(ms / SHIFT_MS);
     drawBoard(ctx, before, (_, r) => r === row);
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(left - 4, BOARD_TOP - 10, right - left + 8, BASE_Y - BOARD_TOP + 20);
-    ctx.clip();
-    before.forEach((col, c) => {
-      if (col.length <= row) return;
-      const px = x(c) + dir * spacing * p;
-      drawStone(ctx, col[row], px, rowY(row), width);
-      // 端から出る石は、反対の端からも描く
-      if (c + dir < 0 || c + dir >= n) drawStone(ctx, col[row], px - dir * spacing * n, rowY(row), width);
-    });
-    ctx.restore();
+    drawShiftedRow(ctx, before, row, dir * spacing * p);
     return;
   }
   ms -= SHIFT_MS;
 
-  // 2. 下が空いた石が落ちる
+  // 2. 下が空いた石が、柱の順にガラガラと落ちる（重さが出るよう加速して落とす）
   if (ms < FALL_MS) {
-    const p = ms / FALL_MS;
     const moving = new Set(out.falls.map((f) => `${f.col},${f.toRow}`));
     drawBoard(ctx, out.afterShift, (c, r) => moving.has(`${c},${r}`));
     for (const f of out.falls) {
-      const drop = f.fromRow - f.toRow;
-      // 落ちる距離が長いほど、重さが出るよう加速して落とす
-      const y = rowY(f.fromRow) + (rowY(f.toRow) - rowY(f.fromRow)) * (drop > 0 ? p * p : 1);
+      const p = isDrop(f) ? Math.max(0, Math.min(1, (ms - fallDelay(f)) / FALL_EACH)) : 1;
+      const y = rowY(f.fromRow) + (rowY(f.toRow) - rowY(f.fromRow)) * p * p;
       drawStone(ctx, f.value, x(f.col), y, width);
     }
     return;
@@ -456,15 +509,25 @@ function drawAnim(ctx: CanvasRenderingContext2D, state: State, anim: Anim<State,
 }
 
 function draw(ctx: CanvasRenderingContext2D, state: State, anim: Anim<State, Outcome> | null) {
+  const ms = anim ? anim.t * durationOf(anim.events) : 0;
+  const amp = anim ? shakeOf(anim.events, ms) : 0;
+  ctx.save();
+  if (amp > 0) ctx.translate(Math.sin(ms * 0.09) * amp, Math.cos(ms * 0.13) * amp);
   drawBackground(ctx);
   const hint = !anim && hinted?.state === state ? hinted.move : null;
-  drawFrame(ctx, anim ? anim.from.cols : state.cols, anim ? anim.events.move.row : hint?.row ?? null);
+  const glow = anim ? anim.events.move.row : dragging?.row ?? hint?.row ?? null;
+  drawFrame(ctx, anim ? anim.from.cols : state.cols, glow);
   if (anim) {
     drawAnim(ctx, state, anim);
-    return;
+    drawDust(ctx, anim.events, ms);
+  } else if (dragging) {
+    drawBoard(ctx, state.cols, (_, r) => r === dragging!.row);
+    drawShiftedRow(ctx, state.cols, dragging.row, dragging.dx);
+  } else {
+    drawBoard(ctx, state.cols);
+    if (hint) drawHint(ctx, state.cols.length, hint);
   }
-  drawBoard(ctx, state.cols);
-  if (hint) drawHint(ctx, state.cols.length, hint);
+  ctx.restore();
 }
 
 function rowAt(py: number): number | null {
@@ -500,16 +563,35 @@ function tap(state: State, px: number, py: number): Step<State, Outcome> | null 
   const row = rowAt(py);
   if (row === null || !rowExists(state.cols, row)) return null;
   const { left, right } = layout(state.cols.length);
+  shiftFrom = 0;
   if (px < left) return shiftStep(state, { row, dir: -1 });
   if (px > right) return shiftStep(state, { row, dir: 1 });
   return null;
 }
 
-/** 段を横になぞった */
+/** 段を横になぞっている途中。段が指についてくる（1マス分まで） */
+function dragMove(state: State, _x0: number, y0: number, x: number): boolean {
+  if (Number.isNaN(x)) {
+    const was = dragging !== null;
+    dragging = null;
+    return was;
+  }
+  const row = rowAt(y0);
+  if (row === null || !rowExists(state.cols, row)) return false;
+  const { spacing } = layout(state.cols.length);
+  dragging = { row, dx: Math.max(-spacing, Math.min(spacing, x - _x0)) };
+  return true;
+}
+
+/** 段を横になぞって離した。1マスの3割より短ければ、元に戻す */
 function drag(state: State, x0: number, y0: number, x1: number): Step<State, Outcome> | null {
   const row = rowAt(y0);
   if (row === null || !rowExists(state.cols, row)) return null;
-  return shiftStep(state, { row, dir: x1 > x0 ? 1 : -1 });
+  const { spacing } = layout(state.cols.length);
+  const dx = x1 - x0;
+  if (Math.abs(dx) < spacing * 0.3) return { state };
+  shiftFrom = Math.min(1, Math.abs(dx) / spacing);
+  return shiftStep(state, { row, dir: dx > 0 ? 1 : -1 });
 }
 
 function goalText(goal: Goal, moves: number): string {
@@ -603,6 +685,7 @@ export const game: GameDef<State, Outcome> = {
   },
   tap,
   drag,
+  dragMove,
   rules: RULES,
   undoable: true,
   showHint(state) {

@@ -68,6 +68,8 @@ export interface GameDef<S, E> {
    * 押した時ではなく離した時に、なぞった距離が短ければ tap、長ければ drag を呼ぶ
    */
   drag?(state: S, x0: number, y0: number, x1: number, y1: number): Step<S, E> | null;
+  /** なぞっている途中。指についてくる見せ方に使う。描き直しが要る時は true。離した・やめた時は x・y とも NaN */
+  dragMove?(state: S, x0: number, y0: number, x: number, y: number): boolean;
   /** true なら星を使わない（解けたかどうかだけ。ステージ選択には ✓ を出す） */
   starless?: boolean;
   /** false なら、新しい項目があるステージに入っても、ルールブックを自動で開かない（遊びの中で教えるゲーム） */
@@ -419,15 +421,23 @@ export async function runGame<S, E>(def: GameDef<S, E>): Promise<void> {
     const step = def.tap(state, x, y);
     if (step) run(step);
   });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!pressed || busy) return;
+    const { x, y } = fit.toLogical(e.clientX, e.clientY);
+    if (def.dragMove?.(state, pressed.x, pressed.y, x, y)) def.draw(ctx, state, anim);
+  });
   canvas.addEventListener('pointerup', (e) => {
     const from = pressed;
     pressed = null;
     if (!from || !def.drag || busy || def.status(state) !== 'playing') return;
     const { x, y } = fit.toLogical(e.clientX, e.clientY);
     const step = Math.abs(x - from.x) >= DRAG_MIN ? def.drag(state, from.x, from.y, x, y) : def.tap(state, from.x, from.y);
+    def.dragMove?.(state, from.x, from.y, NaN, NaN);
     if (step) run(step);
+    else def.draw(ctx, state, anim);
   });
   canvas.addEventListener('pointercancel', () => {
+    if (pressed && def.dragMove?.(state, pressed.x, pressed.y, NaN, NaN)) def.draw(ctx, state, anim);
     pressed = null;
   });
 
