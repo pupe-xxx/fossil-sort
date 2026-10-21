@@ -63,6 +63,15 @@ export interface GameDef<S, E> {
   buttons?(state: S): ToolButton[];
   press?(state: S, id: string): Step<S, E> | null;
   tap(state: S, x: number, y: number): Step<S, E> | null;
+  /**
+   * 指やマウスで横になぞった（x0・y0 から x1・y1 まで）。これがあるゲームでは、
+   * 押した時ではなく離した時に、なぞった距離が短ければ tap、長ければ drag を呼ぶ
+   */
+  drag?(state: S, x0: number, y0: number, x1: number, y1: number): Step<S, E> | null;
+  /** true なら星を使わない（解けたかどうかだけ。ステージ選択には ✓ を出す） */
+  starless?: boolean;
+  /** false なら、新しい項目があるステージに入っても、ルールブックを自動で開かない（遊びの中で教えるゲーム） */
+  autoRules?: boolean;
   /** ルールブックの中身。新しい項目があるステージに初めて入った時は、その項目だけを自動で見せる */
   rules?: RuleEntry[];
   /**
@@ -292,12 +301,14 @@ export async function runGame<S, E>(def: GameDef<S, E>): Promise<void> {
       const button = document.createElement('button');
       button.type = 'button';
       button.disabled = !unlocked(i);
-      const mark = !unlocked(i) ? '🔒' : starText(starsOf(i));
+      const mark = !unlocked(i) ? '🔒' : def.starless ? (starsOf(i) > 0 ? '✓' : '') : starText(starsOf(i));
       button.innerHTML = `<b>${i + 1}</b><span>${mark}</span>`;
       button.addEventListener('click', () => void play(i, false));
       box.append(button);
     }
-    el('total').textContent = `★ ${earned()} / ${def.levelCount * 3}`;
+    el('total').textContent = def.starless
+      ? `✓ ${record.stars.filter((n) => n > 0).length} / ${def.levelCount}`
+      : `★ ${earned()} / ${def.levelCount * 3}`;
     el('select').hidden = false;
   };
 
@@ -315,7 +326,7 @@ export async function runGame<S, E>(def: GameDef<S, E>): Promise<void> {
     render();
     // 新しいルールが出てくるステージに初めて入った時は、その新しいルールだけを見せる
     const fresh = (def.rules ?? []).filter((rule) => rule.from === i && rule.scope !== 'general');
-    if (fresh.length > 0 && !record.seenRules.includes(i)) {
+    if (def.autoRules !== false && fresh.length > 0 && !record.seenRules.includes(i)) {
       record.seenRules.push(i);
       save.save(record);
       showRules(fresh);
@@ -340,9 +351,11 @@ export async function runGame<S, E>(def: GameDef<S, E>): Promise<void> {
     const nextBlock = blockOf(level) + 1;
     const blocked = cleared && !!def.blocks && level + 1 === nextBlock * blockSize && level + 1 < def.levelCount && !blockOpen(nextBlock);
     el('resultTitle').textContent = cleared ? t('クリア！', 'Cleared!') : t('失敗', 'Failed');
-    el('resultStars').textContent = cleared ? starText(stars) : '';
+    el('resultStars').textContent = cleared && !def.starless ? starText(stars) : '';
     el('resultNote').textContent = cleared
-      ? (stars === 3 ? t('最少の手数です', 'Best possible!') : t('もっと少ない手数で解けます', 'It can be done in fewer moves')) +
+      ? def.starless
+        ? ''
+        : (stars === 3 ? t('最少の手数です', 'Best possible!') : t('もっと少ない手数で解けます', 'It can be done in fewer moves')) +
         (blocked ? t(`　次のステージは ★${blockNeed(nextBlock)} で開く（今 ★${earned()}）`, `  The next stages open at ★${blockNeed(nextBlock)} (you have ★${earned()})`) : '')
       : def.failText(state);
     el('resultNext').hidden = !(cleared && hasNext);
@@ -392,11 +405,30 @@ export async function runGame<S, E>(def: GameDef<S, E>): Promise<void> {
     requestAnimationFrame(frame);
   }
 
+  // なぞる操作があるゲームは、離した時に、なぞった距離で tap か drag かを決める
+  const DRAG_MIN = 24;
+  let pressed: { x: number; y: number } | null = null;
   canvas.addEventListener('pointerdown', (e) => {
     if (busy || def.status(state) !== 'playing') return;
     const { x, y } = fit.toLogical(e.clientX, e.clientY);
+    if (def.drag) {
+      pressed = { x, y };
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
     const step = def.tap(state, x, y);
     if (step) run(step);
+  });
+  canvas.addEventListener('pointerup', (e) => {
+    const from = pressed;
+    pressed = null;
+    if (!from || !def.drag || busy || def.status(state) !== 'playing') return;
+    const { x, y } = fit.toLogical(e.clientX, e.clientY);
+    const step = Math.abs(x - from.x) >= DRAG_MIN ? def.drag(state, from.x, from.y, x, y) : def.tap(state, from.x, from.y);
+    if (step) run(step);
+  });
+  canvas.addEventListener('pointercancel', () => {
+    pressed = null;
   });
 
   // マウスを乗せた位置を知らせる。指で触る端末には「乗せる」が無いので、マウスの時だけ

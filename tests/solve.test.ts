@@ -5,25 +5,22 @@ import { encode, solve, step } from '../src/game/solve';
 import { createRng } from '../src/kit/rng';
 
 describe('速い探索は、ルールと同じ動きをする', () => {
-  it('でたらめな盤とでたらめな手で、打った後の盤が一致する', () => {
+  it('でたらめな盤とでたらめな手で、打った後の盤と連鎖の数が一致する', () => {
     const rng = createRng(7);
-    for (let game = 0; game < 300; game++) {
-      const horizontal = rng.next() < 0.5;
-      const cols = Array.from({ length: 3 + rng.int(5) }, () => {
-        const col: number[] = rng.next() < 0.15 ? [FOSSIL] : [];
-        const h = rng.int(CAP + 1 - col.length);
-        for (let k = 0; k < h; k++) col.push(rng.int(4));
-        return col;
-      });
-      let state = createState({ cols, horizontal, par: 0, limit: 999 });
-      for (let k = 0; k < 20; k++) {
+    for (let game = 0; game < 400; game++) {
+      const cols = Array.from({ length: 4 + rng.int(3) }, () =>
+        Array.from({ length: rng.int(CAP + 1) }, () => (rng.next() < 0.08 ? FOSSIL : rng.int(4))),
+      );
+      let state = createState({ cols, goal: { kind: 'clear' }, moves: 99 });
+      for (let k = 0; k < 15; k++) {
         const moves = legalMoves(state);
         if (moves.length === 0) break;
         const m = rng.pick(moves);
-        const fast = step(encode(state.cols), m.from, m.to, horizontal);
+        const fast = step(encode(state.cols), m);
         const out = play(state, m);
-        if (!out) break; // 化石を全部掘った後は打てない
-        expect(fast).toEqual(encode(out.state.cols));
+        if (!out) break;
+        expect(fast?.cols).toEqual(encode(out.state.cols));
+        expect(fast?.chain).toBe(out.rounds.length);
         state = out.state;
       }
     }
@@ -36,8 +33,9 @@ describe('ステージ', () => {
       let state = createState(level);
       for (const m of SOLUTIONS[i]) state = play(state, m)!.state;
       expect(status(state)).toBe('cleared');
-      expect(SOLUTIONS[i]).toHaveLength(level.par);
-      expect(solve(createState(level), 2_000_000)!.moves).toHaveLength(level.par);
+      expect(SOLUTIONS[i]).toHaveLength(level.moves);
+      const shorter = solve(createState({ ...level, moves: level.moves - 1 }));
+      expect(shorter).toBeNull();
     });
   });
 });
